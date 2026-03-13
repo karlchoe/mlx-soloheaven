@@ -126,6 +126,9 @@ class OpenAIProxyEngine:
 
     @staticmethod
     def _messages_match(stored: list[dict], incoming: list[dict]) -> bool:
+        # Treat the stored session as a prefix that must match exactly.
+        # If the incoming request diverges, the caller should replace the
+        # remembered session state instead of pretending it can resume it.
         if len(incoming) < len(stored):
             return False
         for idx, s_msg in enumerate(stored):
@@ -153,6 +156,8 @@ class OpenAIProxyEngine:
         )
 
         try:
+            # Probe the upstream backend early so startup failures surface before
+            # the first user request, and so operators can see model ID drift.
             with httpx.Client(timeout=10.0) as client:
                 resp = client.get(self._endpoint("/models"), headers=self._headers())
                 resp.raise_for_status()
@@ -202,6 +207,9 @@ class OpenAIProxyEngine:
         if tools:
             payload["tools"] = tools
         if session_id:
+            # Reuse the OpenAI `user` field as a stable session identifier.
+            # That keeps upstream-side accounting or cache-like behavior aligned
+            # with the local session concept without inventing a custom field.
             payload["user"] = session_id
         if thinking is not None:
             payload["enable_thinking"] = thinking
@@ -236,6 +244,9 @@ class OpenAIProxyEngine:
                 else:
                     value_text = json.dumps(value, ensure_ascii=False)
                 params.append(f"<parameter={key}>{value_text}</parameter>")
+            # The browser chat path expects tool calls in the model-facing XML
+            # representation, so reassemble streamed OpenAI deltas back into the
+            # same textual contract before handing them to downstream parsing.
             blocks.append(f"<tool_call><function={name}>{''.join(params)}</function></tool_call>")
         return "".join(blocks)
 
@@ -382,6 +393,9 @@ class OpenAIProxyEngine:
                                 yield GenerationResult(text=text)
 
                         for tc in delta.get("tool_calls") or []:
+                            # OpenAI-compatible streaming can split one tool call
+                            # across many chunks. Buffer by index until we have a
+                            # coherent function name + arguments payload.
                             index = tc.get("index", 0)
                             entry = tool_calls.setdefault(
                                 index,
@@ -424,9 +438,13 @@ class OpenAIProxyEngine:
             return
         session = self._sessions.get(session_id)
         if session is None:
+            # First completion for this session: initialize the in-memory view
+            # from the history that was just persisted to SQLite.
             session = SessionState(messages=messages)
             self._sessions[session_id] = session
         else:
+            # Always overwrite with the post-response history so stale in-memory
+            # state cannot drift away from the database-backed session timeline.
             session.messages = messages
             session.touch()
 
