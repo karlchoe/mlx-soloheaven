@@ -1,9 +1,13 @@
 """FastAPI application factory and server entry point."""
 
+from __future__ import annotations
+
 import logging
 import os
 import socket
 import sys
+from types import SimpleNamespace
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,22 +22,42 @@ logging.basicConfig(
 logger = logging.getLogger("soloheaven")
 
 
+def _build_model_config(base_cfg: Config, model_cfg: Any) -> Config:
+    return Config(
+        model_path=model_cfg.model_path,
+        model_alias=model_cfg.alias,
+        openai_base_url=model_cfg.openai_base_url,
+        openai_api_key=model_cfg.openai_api_key,
+        host=base_cfg.host,
+        port=base_cfg.port,
+        default_temperature=model_cfg.default_temperature,
+        default_top_p=model_cfg.default_top_p,
+        default_min_p=model_cfg.default_min_p,
+        default_top_k=model_cfg.default_top_k,
+        default_repetition_penalty=model_cfg.default_repetition_penalty,
+        default_max_tokens=model_cfg.default_max_tokens,
+        thinking_budget=model_cfg.thinking_budget,
+        enable_thinking=model_cfg.enable_thinking,
+        data_dir=base_cfg.data_dir,
+        verbose=base_cfg.verbose,
+    )
+
+
 def create_app(cfg: Config) -> FastAPI:
     """Build the FastAPI application with all routes and middleware."""
-    from mlx_soloheaven.engine.mlx_engine import MLXEngine
-    from mlx_soloheaven.storage import database as db
-    from mlx_soloheaven.api import openai_compat, chat, admin, settings, compaction
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse, FileResponse
 
-    # Set engine logger level based on verbose flag
-    engine_logger = logging.getLogger("mlx_soloheaven.engine.mlx_engine")
-    if not cfg.verbose:
-        engine_logger.setLevel(logging.INFO)  # verbose=False: DEBUG hidden (default)
-    else:
-        engine_logger.setLevel(logging.DEBUG)  # verbose=True: show all
+    from mlx_soloheaven.api import admin, chat, compaction, openai_compat, settings
+    from mlx_soloheaven.engine.openai_proxy_engine import OpenAIProxyEngine
+    from mlx_soloheaven.storage import database as db
+
+    proxy_logger = logging.getLogger("mlx_soloheaven.engine.openai_proxy_engine")
+    proxy_logger.setLevel(logging.DEBUG if cfg.verbose else logging.INFO)
 
     app = FastAPI(
-        title="MLX SoloHeaven",
-        description="Single-user LLM inference server with KV cache optimization",
+        title="SoloHeaven",
+        description="OpenAI-compatible chat server for proxied Qwen3.5-class models",
         version="0.1.0",
     )
 
@@ -44,59 +68,46 @@ def create_app(cfg: Config) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Log validation errors with request body for debugging
-    from fastapi.exceptions import RequestValidationError
-    from fastapi.responses import JSONResponse as _JSONResponse
-
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request, exc):
         body = None
         try:
-            body = await request.body()
-            body = body.decode("utf-8", errors="replace")[:2000]
+            body = (await request.body()).decode("utf-8", errors="replace")[:2000]
         except Exception:
             pass
         logger.error(
-            f"[422] {request.method} {request.url.path} | "
-            f"errors={exc.errors()} | body={body}"
+            "[422] %s %s | errors=%s | body=%s",
+            request.method,
+            request.url.path,
+            exc.errors(),
+            body,
         )
-        return _JSONResponse(
-            status_code=422,
-            content={"detail": exc.errors()},
+        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+    engines: dict[str, Any] = {}
+    model_configs = cfg.models or [
+        SimpleNamespace(
+            model_path=cfg.model_path,
+            alias=cfg.model_alias,
+            openai_base_url=cfg.openai_base_url,
+            openai_api_key=cfg.openai_api_key,
+            default_temperature=cfg.default_temperature,
+            default_top_p=cfg.default_top_p,
+            default_min_p=cfg.default_min_p,
+            default_top_k=cfg.default_top_k,
+            default_repetition_penalty=cfg.default_repetition_penalty,
+            default_max_tokens=cfg.default_max_tokens,
+            thinking_budget=cfg.thinking_budget,
+            enable_thinking=cfg.enable_thinking,
+            model_id=cfg.model_alias or cfg.model_path,
         )
+    ]
 
-    # Build per-model configs and engines
-    engines: dict[str, MLXEngine] = {}
+    for model_cfg in model_configs:
+        engine = OpenAIProxyEngine(_build_model_config(cfg, model_cfg))
+        engines[model_cfg.model_id] = engine
 
-    if cfg.models:
-        for mcfg in cfg.models:
-            # Create a Config per model with shared server settings
-            model_cfg = Config(
-                model_path=mcfg.model_path,
-                host=cfg.host,
-                port=cfg.port,
-                default_temperature=mcfg.default_temperature,
-                default_top_p=mcfg.default_top_p,
-                default_min_p=mcfg.default_min_p,
-                default_top_k=mcfg.default_top_k,
-                default_repetition_penalty=mcfg.default_repetition_penalty,
-                default_max_tokens=mcfg.default_max_tokens,
-                thinking_budget=mcfg.thinking_budget,
-                enable_thinking=mcfg.enable_thinking,
-                memory_budget_gb=cfg.memory_budget_gb,
-                disk_budget_gb=cfg.disk_budget_gb,
-                data_dir=cfg.data_dir,
-                verbose=cfg.verbose,
-                gpu_keepalive=cfg.gpu_keepalive,
-            )
-            engine = MLXEngine(model_cfg)
-            engines[mcfg.model_id] = engine
-    else:
-        engine = MLXEngine(cfg)
-        engines["default"] = engine
-
-    # Default engine = first loaded
-    default_engine: MLXEngine = None  # type: ignore
+    default_engine: Any = None
 
     @app.on_event("startup")
     async def startup():
@@ -104,36 +115,30 @@ def create_app(cfg: Config) -> FastAPI:
 
         db.set_db_path(cfg.db_path)
         await db.init_db()
-        logger.info(f"Database initialized: {cfg.db_path}")
+        logger.info("Database initialized: %s", cfg.db_path)
 
         for model_id, engine in engines.items():
             engine.load_model()
-            logger.info(f"Model ready: {model_id} -> {engine.model_id}")
+            logger.info("Model ready: %s -> %s", model_id, engine.model_id)
 
-        default_engine = list(engines.values())[0]
-
-        # Set engine registry for API routers
+        default_engine = next(iter(engines.values()))
         openai_compat.set_engines(engines, default_engine)
         chat.set_engines(engines, default_engine)
         admin.set_engines(engines, default_engine)
         compaction.set_engine(default_engine)
         admin.install_log_handler()
 
-        logger.info(f"Server ready on http://{cfg.host}:{cfg.port}")
-        logger.info(f"  Web UI:     http://{cfg.host}:{cfg.port}/")
-        logger.info(f"  Admin:      http://{cfg.host}:{cfg.port}/admin")
-        logger.info(f"  OpenAI API: http://{cfg.host}:{cfg.port}/v1/chat/completions")
-        logger.info(f"  Settings:   http://{cfg.host}:{cfg.port}/api/sessions/{{id}}/settings")
-        logger.info(f"  Compaction: http://{cfg.host}:{cfg.port}/api/sessions/{{id}}/compact")
-        logger.info(f"  Models:     {list(engines.keys())}")
-        logger.info(
-            f"  Cache budget: {cfg.memory_budget_gb}GB memory, {cfg.disk_budget_gb}GB disk"
-        )
+        logger.info("Server ready on http://%s:%s", cfg.host, cfg.port)
+        logger.info("  Web UI:     http://%s:%s/", cfg.host, cfg.port)
+        logger.info("  Admin:      http://%s:%s/admin", cfg.host, cfg.port)
+        logger.info("  OpenAI API: http://%s:%s/v1/chat/completions", cfg.host, cfg.port)
+        logger.info("  Models:     %s", list(engines.keys()))
 
     @app.get("/health")
     async def health():
         return {
             "status": "ok",
+            "backend": "openai-compatible",
             "models": {
                 model_id: {
                     "model_id": engine.model_id,
@@ -149,10 +154,8 @@ def create_app(cfg: Config) -> FastAPI:
     app.include_router(compaction.router)
     app.include_router(admin.router)
 
-    # Serve web UI static files (must be last — catches all unmatched routes)
     web_dir = os.path.join(os.path.dirname(__file__), "web")
     if os.path.isdir(web_dir):
-        from fastapi.responses import FileResponse
 
         @app.get("/admin")
         async def admin_page():
@@ -169,7 +172,7 @@ def _check_port(host: str, port: int):
     try:
         sock.bind((host if host != "0.0.0.0" else "127.0.0.1", port))
     except OSError:
-        logger.error(f"Port {port} is already in use. Stop the existing server first.")
+        logger.error("Port %s is already in use. Stop the existing server first.", port)
         sys.exit(1)
     finally:
         sock.close()
@@ -180,14 +183,5 @@ def run_server(cfg: Config):
     import uvicorn
 
     _check_port(cfg.host, cfg.port)
-
-    # Create the app directly and run it — avoids __getattr__ / lazy import issues
     app = create_app(cfg)
-
-    uvicorn.run(
-        app,
-        host=cfg.host,
-        port=cfg.port,
-        log_level="info",
-        loop="asyncio",
-    )
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="info", loop="asyncio")

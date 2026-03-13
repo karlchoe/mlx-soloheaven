@@ -278,7 +278,7 @@
     <div class="tabs">
         <div class="tab active" onclick="showTab('logs')">Logs</div>
         <div class="tab" onclick="showTab('models')">Models</div>
-        <div class="tab" onclick="showTab('cache')">Cache</div>
+        <div class="tab" onclick="showTab('cache')">Sessions</div>
         <div class="tab" onclick="showTab('db')">Database</div>
     </div>
 
@@ -309,8 +309,8 @@
             <div id="cache-engines"></div>
             <div id="cache-disk"></div>
             <div class="btn-group">
-                <button class="btn btn-danger" onclick="resetCache()">Reset Cache</button>
-                <button class="btn btn-danger" onclick="resetAll()">Reset All (Cache + DB)</button>
+                <button class="btn btn-danger" onclick="resetCache()">Reset Sessions</button>
+                <button class="btn btn-danger" onclick="resetAll()">Reset All (Sessions + DB)</button>
                 <button class="btn" onclick="loadCache()">Refresh</button>
             </div>
         </div>
@@ -441,18 +441,18 @@
                             <tr><td>repetition_penalty</td><td class="mono">${d.repetition_penalty}</td><td style="color:var(--text-muted)">Repeat penalty (1.0=off)</td></tr>
                             <tr><td>max_tokens</td><td class="mono">${d.max_tokens.toLocaleString()}</td><td style="color:var(--text-muted)">Max output tokens</td></tr>
                             <tr style="border-top:1px solid var(--border)">
+                                <td>backend</td>
+                                <td class="mono">${esc(m.backend)}</td>
+                                <td style="color:var(--text-muted)">Upstream serving protocol</td>
+                            </tr>
+                            <tr><td>provider_url</td><td class="mono">${esc(m.openai_base_url)}</td><td style="color:var(--text-muted)">OpenAI-compatible base URL</td></tr>
+                            <tr style="border-top:1px solid var(--border)">
                                 <td>thinking</td>
                                 <td class="mono">${t.enabled ? '<span style="color:var(--green)">on</span>' : '<span style="color:var(--text-muted)">off</span>'}</td>
-                                <td style="color:var(--text-muted)">Think tag injection</td>
+                                <td style="color:var(--text-muted)">Enable reasoning mode by default</td>
                             </tr>
                             <tr><td>thinking_budget</td><td class="mono">${t.budget.toLocaleString()}</td><td style="color:var(--text-muted)">Max thinking tokens (0=unlimited)</td></tr>
-                            <tr style="border-top:1px solid var(--border)">
-                                <td>memory_budget</td>
-                                <td class="mono">${m.cache_budget.memory_gb} GB</td>
-                                <td style="color:var(--text-muted)">In-memory KV cache limit</td>
-                            </tr>
-                            <tr><td>disk_budget</td><td class="mono">${m.cache_budget.disk_gb} GB</td><td style="color:var(--text-muted)">On-disk KV cache limit</td></tr>
-                            <tr><td>active_sessions</td><td class="mono">${m.sessions}</td><td style="color:var(--text-muted)">In-memory sessions</td></tr>
+                            <tr><td>active_sessions</td><td class="mono">${m.sessions}</td><td style="color:var(--text-muted)">Stored local session histories</td></tr>
                         </tbody>
                     </table>
                 </div>`;
@@ -470,12 +470,12 @@
         document.getElementById('cache-stats').innerHTML = `
             <div class="stats-grid">
                 <div class="stat-card">
-                    <div class="stat-label">Memory Usage</div>
-                    <div class="stat-value">${data.total_memory_gb} GB</div>
+                    <div class="stat-label">Active Sessions</div>
+                    <div class="stat-value">${Object.values(data.engines).reduce((acc, info) => acc + info.session_count, 0)}</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-label">Disk Usage</div>
-                    <div class="stat-value">${data.total_disk_gb} GB</div>
+                    <div class="stat-label">Runtime</div>
+                    <div class="stat-value">Proxy</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Engines</div>
@@ -491,17 +491,14 @@
         let enginesHtml = '';
         for (const [modelId, info] of Object.entries(data.engines)) {
             enginesHtml += `<div class="card">
-                <div class="card-title">${esc(info.model_id)} &middot; ${info.session_count} sessions &middot; thinking=${info.enable_thinking}</div>`;
-
-            if (info.base_caches.length > 0) {
-                enginesHtml += `<div style="margin-bottom:12px;font-size:0.75rem;color:var(--text-muted)">
-                    Base caches: ${info.base_caches.map(b => `${b.hash} (${b.token_count} tok, ${b.hit_count} hits)`).join(', ')}
+                <div class="card-title">${esc(info.model_id)} &middot; ${info.session_count} sessions &middot; thinking=${info.enable_thinking}</div>
+                <div style="margin-bottom:12px;font-size:0.75rem;color:var(--text-muted)">
+                    Provider: ${esc(info.provider_url)}
                 </div>`;
-            }
 
             if (info.sessions.length > 0) {
                 enginesHtml += `<table><thead><tr>
-                    <th>Session</th><th>Messages</th><th>Cache Tokens</th><th>Size</th><th>Last Used</th>
+                    <th>Session</th><th>Messages</th><th>Tracked Tokens</th><th>State</th><th>Last Used</th>
                 </tr></thead><tbody>`;
                 for (const s of info.sessions) {
                     const age = s.age_s < 60 ? `${s.age_s}s ago` :
@@ -511,7 +508,7 @@
                         <td class="mono">${esc(s.session_id.substring(0, 24))}...</td>
                         <td>${s.messages}</td>
                         <td class="mono">${s.cache_tokens.toLocaleString()}</td>
-                        <td class="mono">${s.cache_size_mb} MB</td>
+                        <td class="mono">in-memory</td>
                         <td>${age}</td>
                     </tr>`;
                 }
@@ -589,10 +586,10 @@
 
     // --- Reset actions ---
     async function resetCache() {
-        if (!confirm('Clear all KV caches (memory + disk)?')) return;
+        if (!confirm('Clear all local session state?')) return;
         const r = await fetch(`${API}/api/admin/cache/reset`, { method: 'POST' });
         const data = await r.json();
-        alert(`Cleared: ${data.cleared.memory_sessions} sessions, ${data.cleared.disk_files} files, ${data.cleared.base_caches} base caches`);
+        alert(`Cleared: ${data.cleared.memory_sessions} sessions`);
         loadCache();
     }
 
@@ -604,7 +601,7 @@
     }
 
     async function resetAll() {
-        if (!confirm('Reset EVERYTHING? (KV caches + DB data)')) return;
+        if (!confirm('Reset EVERYTHING? (session state + DB data)')) return;
         if (!confirm('Are you sure? This cannot be undone.')) return;
         await fetch(`${API}/api/admin/reset-all`, { method: 'POST' });
         alert('All data cleared');

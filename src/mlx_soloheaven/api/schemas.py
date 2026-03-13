@@ -127,7 +127,7 @@ class ModelInfo(BaseModel):
     id: str
     object: Literal["model"] = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "mlx-soloheaven"
+    owned_by: str = "soloheaven"
 
 
 class ModelListResponse(BaseModel):

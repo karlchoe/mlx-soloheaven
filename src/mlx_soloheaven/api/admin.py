@@ -1,6 +1,6 @@
-"""
-Admin API — real-time logs, cache/DB overview, and cache reset.
-"""
+"""Admin API for logs, model settings, session state, and DB overview."""
+
+from __future__ import annotations
 
 import asyncio
 import json
@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from collections import deque
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -17,25 +17,22 @@ from mlx_soloheaven.storage import database as db
 
 router = APIRouter(prefix="/api/admin")
 
-# Engine registry — set by server.py
-_engines: dict[str, "MLXEngine"] = {}
-_default_engine = None
+_engines: dict[str, Any] = {}
+_default_engine: Any = None
 
 
-def set_engines(engines: dict, default):
+def set_engines(engines: dict[str, Any], default: Any):
     global _engines, _default_engine
     _engines = engines
     _default_engine = default
 
 
-# --- Real-time log streaming via SSE ---
-
 class LogBuffer(logging.Handler):
-    """Captures log records and broadcasts to SSE subscribers."""
+    """Captures log records and broadcasts them to SSE subscribers."""
 
     def __init__(self, maxlen: int = 500):
         super().__init__()
-        self.buffer: deque[dict] = deque(maxlen=maxlen)
+        self.buffer: deque[dict[str, Any]] = deque(maxlen=maxlen)
         self.subscribers: list[asyncio.Queue] = []
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -50,37 +47,34 @@ class LogBuffer(logging.Handler):
             "message": self.format(record),
         }
         self.buffer.append(entry)
-        for q in list(self.subscribers):
+        for queue in list(self.subscribers):
             try:
                 if self._loop and not self._loop.is_closed():
-                    self._loop.call_soon_threadsafe(q.put_nowait, entry)
+                    self._loop.call_soon_threadsafe(queue.put_nowait, entry)
             except Exception:
                 pass
 
     def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=200)
-        self.subscribers.append(q)
-        return q
+        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self.subscribers.append(queue)
+        return queue
 
-    def unsubscribe(self, q: asyncio.Queue):
-        if q in self.subscribers:
-            self.subscribers.remove(q)
+    def unsubscribe(self, queue: asyncio.Queue):
+        if queue in self.subscribers:
+            self.subscribers.remove(queue)
 
 
-# Global log buffer
 log_buffer = LogBuffer()
 log_buffer.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
 
 
 def install_log_handler():
-    """Install the log buffer on root logger to capture everything."""
+    """Install the log buffer on the root logger."""
     root = logging.getLogger()
     log_buffer.setLevel(logging.DEBUG)
     root.addHandler(log_buffer)
-    # Set event loop for thread-safe puts
     try:
-        loop = asyncio.get_event_loop()
-        log_buffer.set_loop(loop)
+        log_buffer.set_loop(asyncio.get_event_loop())
     except RuntimeError:
         pass
 
@@ -88,26 +82,23 @@ def install_log_handler():
 @router.get("/logs/stream")
 async def stream_logs():
     """SSE endpoint for real-time log streaming."""
-    # Ensure loop is set
     log_buffer.set_loop(asyncio.get_event_loop())
 
     async def _generate() -> AsyncGenerator[str, None]:
-        q = log_buffer.subscribe()
+        queue = log_buffer.subscribe()
         try:
-            # Send recent history first
             for entry in list(log_buffer.buffer)[-100:]:
                 yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
-            # Stream new logs
             while True:
                 try:
-                    entry = await asyncio.wait_for(q.get(), timeout=30.0)
+                    entry = await asyncio.wait_for(queue.get(), timeout=30.0)
                     yield f"data: {json.dumps(entry, ensure_ascii=False)}\n\n"
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
         except (asyncio.CancelledError, GeneratorExit):
             pass
         finally:
-            log_buffer.unsubscribe(q)
+            log_buffer.unsubscribe(queue)
 
     return StreamingResponse(
         _generate(),
@@ -119,11 +110,8 @@ async def stream_logs():
 @router.get("/logs/recent")
 async def recent_logs(limit: int = 200):
     """Get recent log entries."""
-    entries = list(log_buffer.buffer)[-limit:]
-    return entries
+    return list(log_buffer.buffer)[-limit:]
 
-
-# --- Models overview ---
 
 @router.get("/models")
 async def models_overview():
@@ -131,37 +119,33 @@ async def models_overview():
     models = []
     for model_id, engine in _engines.items():
         cfg = engine.cfg
-        models.append({
-            "model_id": engine.model_id,
-            "model_path": cfg.model_path,
-            "defaults": {
-                "temperature": cfg.default_temperature,
-                "top_p": cfg.default_top_p,
-                "min_p": cfg.default_min_p,
-                "top_k": cfg.default_top_k,
-                "repetition_penalty": cfg.default_repetition_penalty,
-                "max_tokens": cfg.default_max_tokens,
-            },
-            "thinking": {
-                "enabled": cfg.enable_thinking,
-                "budget": cfg.thinking_budget,
-                "think_end_token": cfg.think_end_token,
-                "think_start_token": cfg.think_start_token,
-            },
-            "cache_budget": {
-                "memory_gb": cfg.memory_budget_gb,
-                "disk_gb": cfg.disk_budget_gb,
-            },
-            "sessions": len(engine._sessions),
-        })
+        models.append(
+            {
+                "model_id": model_id,
+                "backend": "openai-compatible",
+                "model_path": cfg.model_path,
+                "openai_base_url": cfg.openai_base_url,
+                "defaults": {
+                    "temperature": cfg.default_temperature,
+                    "top_p": cfg.default_top_p,
+                    "min_p": cfg.default_min_p,
+                    "top_k": cfg.default_top_k,
+                    "repetition_penalty": cfg.default_repetition_penalty,
+                    "max_tokens": cfg.default_max_tokens,
+                },
+                "thinking": {
+                    "enabled": cfg.enable_thinking,
+                    "budget": cfg.thinking_budget,
+                },
+                "sessions": len(engine._sessions),
+            }
+        )
     return {"models": models}
 
 
-# --- Cache overview ---
-
 @router.get("/cache")
 async def cache_overview():
-    """Detailed cache overview across all engines."""
+    """Return active session metadata for each engine."""
     result = {
         "engines": {},
         "disk_files": [],
@@ -171,88 +155,50 @@ async def cache_overview():
 
     for model_id, engine in _engines.items():
         sessions = []
-        for sid, s in engine._sessions.items():
-            cache_size = engine.cache_manager._estimate_cache_size(s.cache) if s.cache else 0
-            sessions.append({
-                "session_id": sid,
-                "messages": len(s.messages),
-                "cache_tokens": s.total_cache_tokens,
-                "cache_size_mb": round(cache_size / 1e6, 1),
-                "last_used": s.last_used,
-                "age_s": round(time.time() - s.last_used, 0),
-            })
-        sessions.sort(key=lambda x: x["last_used"], reverse=True)
-
-        base_caches = []
-        for h, bc in engine._base_caches.items():
-            base_caches.append({
-                "hash": h,
-                "token_count": bc.token_count,
-                "hit_count": bc.hit_count,
-                "created": bc.created,
-            })
+        for session_id, state in engine._sessions.items():
+            sessions.append(
+                {
+                    "session_id": session_id,
+                    "messages": len(state.messages),
+                    "cache_tokens": getattr(state, "total_cache_tokens", 0),
+                    "cache_size_mb": 0.0,
+                    "last_used": state.last_used,
+                    "age_s": round(time.time() - state.last_used, 0),
+                }
+            )
+        sessions.sort(key=lambda item: item["last_used"], reverse=True)
 
         result["engines"][model_id] = {
             "model_id": engine.model_id,
+            "provider_url": engine.cfg.openai_base_url,
             "enable_thinking": engine.cfg.enable_thinking,
             "sessions": sessions,
             "session_count": len(sessions),
-            "base_caches": base_caches,
+            "base_caches": [],
             "cache_manager": engine.cache_manager.stats(),
         }
 
-    # Disk files
-    for model_id, engine in _engines.items():
-        cache_dir = engine.cfg.cache_dir
-        if os.path.isdir(cache_dir):
-            for fname in sorted(os.listdir(cache_dir)):
-                if fname.endswith(".safetensors"):
-                    fpath = os.path.join(cache_dir, fname)
-                    fsize = os.path.getsize(fpath)
-                    result["disk_files"].append({
-                        "file": fname,
-                        "size_mb": round(fsize / 1e6, 1),
-                        "model": model_id,
-                    })
-                    result["total_disk_gb"] += fsize / 1e9
-
-    # Total memory
-    for model_id, engine in _engines.items():
-        for sid, s in engine._sessions.items():
-            if s.cache:
-                result["total_memory_gb"] += engine.cache_manager._estimate_cache_size(s.cache) / 1e9
-    result["total_memory_gb"] = round(result["total_memory_gb"], 2)
-    result["total_disk_gb"] = round(result["total_disk_gb"], 2)
-
     return result
 
-
-# --- DB overview ---
 
 @router.get("/db")
 async def db_overview():
     """Database tables overview."""
     async with db.get_db() as conn:
-        # Sessions
         sessions = await conn.execute_fetchall(
             "SELECT s.id, s.title, s.created_at, s.updated_at, "
             "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) as msg_count "
             "FROM sessions s ORDER BY s.updated_at DESC"
         )
-        session_list = [dict(r) for r in sessions]
+        session_list = [dict(row) for row in sessions]
 
-        # Message stats
-        msg_stats = await conn.execute_fetchall(
-            "SELECT role, COUNT(*) as cnt FROM messages GROUP BY role"
-        )
-        msg_summary = {r["role"]: r["cnt"] for r in msg_stats}
+        msg_stats = await conn.execute_fetchall("SELECT role, COUNT(*) as cnt FROM messages GROUP BY role")
+        msg_summary = {row["role"]: row["cnt"] for row in msg_stats}
 
-        # Total counts
         total_sessions = len(session_list)
         total_messages = await conn.execute_fetchall("SELECT COUNT(*) as cnt FROM messages")
         total_memories = await conn.execute_fetchall("SELECT COUNT(*) as cnt FROM memories")
 
-        # DB file size
         db_size = 0
         if db._db_path and os.path.exists(db._db_path):
             db_size = os.path.getsize(db._db_path)
@@ -268,49 +214,34 @@ async def db_overview():
     }
 
 
-# --- Cache reset ---
-
 @router.post("/cache/reset")
 async def reset_cache():
-    """Clear all KV caches (memory + disk) and DB cache references."""
+    """Clear in-memory session state held by the proxy layer."""
     cleared = {"memory_sessions": 0, "disk_files": 0, "base_caches": 0}
 
-    for model_id, engine in _engines.items():
-        # Clear in-memory sessions
+    for engine in _engines.values():
         cleared["memory_sessions"] += len(engine._sessions)
         engine._sessions.clear()
 
-        # Clear base caches
-        cleared["base_caches"] += len(engine._base_caches)
-        engine._base_caches.clear()
+        base_caches = getattr(engine, "_base_caches", None)
+        if isinstance(base_caches, dict):
+            cleared["base_caches"] += len(base_caches)
+            base_caches.clear()
 
-        # Clear cache manager
-        engine.cache_manager.memory_caches.clear()
-        engine.cache_manager.disk_index.clear()
+        memory_caches = getattr(engine.cache_manager, "memory_caches", None)
+        if hasattr(memory_caches, "clear"):
+            memory_caches.clear()
 
-        # Delete disk cache files
-        cache_dir = engine.cfg.cache_dir
-        if os.path.isdir(cache_dir):
-            for fname in os.listdir(cache_dir):
-                if fname.endswith(".safetensors"):
-                    try:
-                        os.remove(os.path.join(cache_dir, fname))
-                        cleared["disk_files"] += 1
-                    except OSError:
-                        pass
-
-        # Clear disk index
-        if hasattr(engine, "_disk_session_ids"):
-            engine._disk_session_ids.clear()
+        disk_index = getattr(engine.cache_manager, "disk_index", None)
+        if hasattr(disk_index, "clear"):
+            disk_index.clear()
 
     return {"status": "ok", "cleared": cleared}
 
 
-# --- DB reset ---
-
 @router.post("/db/reset")
 async def reset_db():
-    """Clear all data from DB tables (sessions, messages, memories)."""
+    """Clear all data from DB tables."""
     async with db.get_db() as conn:
         await conn.execute("DELETE FROM messages")
         await conn.execute("DELETE FROM sessions")
@@ -319,15 +250,9 @@ async def reset_db():
     return {"status": "ok"}
 
 
-# --- Full reset (cache + DB) ---
-
 @router.post("/reset-all")
 async def reset_all():
-    """Clear everything: KV caches + DB data."""
+    """Clear both in-memory session state and database data."""
     cache_result = await reset_cache()
-    db_result = await reset_db()
-    return {
-        "status": "ok",
-        "cache": cache_result["cleared"],
-        "db": "cleared",
-    }
+    await reset_db()
+    return {"status": "ok", "sessions": cache_result["cleared"], "db": "cleared"}

@@ -1,4 +1,4 @@
-"""Allow running as `python -m mlx_soloheaven`."""
+"""Allow running the package as a module."""
 
 from mlx_soloheaven.cli import main
 

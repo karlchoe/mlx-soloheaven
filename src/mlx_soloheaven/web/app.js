@@ -356,7 +356,7 @@ async function sendMessage() {
 function emptyState() {
     return `<div class="empty-state">
         <div class="empty-logo">SoloHeaven</div>
-        <p>Single-user LLM with KV Cache Optimization</p>
+        <p>OpenAI-compatible Qwen chat server</p>
     </div>`;
 }
 
@@ -386,19 +386,21 @@ function assistantMsgHtml(content, thinking, stats) {
 
 function buildStatsBar(stats) {
     const ci = stats.cache_info || {};
-    let cacheTag;
+    let runtimeTag;
     if (stats.cache_hit) {
-        const detail = ci.cached_tokens ? ` — ${ci.cached_tokens} tokens reused` : '';
-        cacheTag = `<span class="stat-cache-hit">KV CACHE HIT${detail}</span>`;
+        const detail = ci.cached_tokens ? ` - ${ci.cached_tokens} tokens reused` : '';
+        runtimeTag = `<span class="stat-cache-hit">CACHE HIT${detail}</span>`;
+    } else if (ci.type === 'session_resume') {
+        runtimeTag = `<span class="stat-cache-hit">SESSION RESUMED</span>`;
     } else {
-        const detail = ci.detail || 'No cache';
-        cacheTag = `<span class="stat-cache-miss">MISS</span> <span class="stat-cache-detail">${esc(detail)}</span>`;
+        const detail = ci.detail || 'Upstream backend';
+        runtimeTag = `<span class="stat-cache-miss">UPSTREAM</span> <span class="stat-cache-detail">${esc(detail)}</span>`;
     }
     const queueTag = stats.queue_wait > 0
         ? `<span class="stat-item"><span class="stat-label">Queue</span> <span class="stat-value" style="color:var(--yellow)">${stats.queue_wait}s</span></span>`
         : '';
     return `<div class="stats-bar">
-        ${cacheTag}
+        ${runtimeTag}
         <span class="stat-item"><span class="stat-label">TTFT</span> <span class="stat-value">${stats.ttft}s</span></span>
         ${queueTag}
         <span class="stat-item"><span class="stat-label">TPS</span> <span class="stat-value">${stats.gen_tps}</span></span>
@@ -441,7 +443,7 @@ async function loadCacheStats() {
         const r = await fetch(`${API}/api/cache/stats`);
         const s = await r.json();
         cacheStatsText.innerHTML =
-            `${s.active_sessions || 0} sessions &middot; ${s.memory_caches || 0} cached &middot; ${s.memory_usage_gb || 0}GB`;
+            `${s.active_sessions || 0} sessions &middot; upstream OpenAI-compatible backend`;
     } catch { cacheStatsText.textContent = ''; }
 }
 

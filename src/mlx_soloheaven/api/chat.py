@@ -1,41 +1,40 @@
 """
 Chat session API for the web frontend.
-Manages sessions, messages, and provides SSE streaming with stats.
+Manages sessions, messages, and provides SSE streaming with runtime stats.
 """
 
 import asyncio
 import json
 import time
 import logging
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from mlx_soloheaven.engine.mlx_engine import MLXEngine
 from mlx_soloheaven.engine.tool_parser import split_thinking_and_content
 from mlx_soloheaven.storage import database as db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
-engine: MLXEngine = None  # type: ignore
-_engines: dict[str, MLXEngine] = {}
+engine: Any = None
+_engines: dict[str, Any] = {}
 
 
-def set_engine(e: MLXEngine):
+def set_engine(e):
     global engine
     engine = e
 
 
-def set_engines(engines: dict[str, MLXEngine], default: MLXEngine):
+def set_engines(engines: dict[str, Any], default):
     global engine, _engines
     _engines = engines
     engine = default
 
 
-def _get_engine(model: str | None) -> MLXEngine:
+def _get_engine(model: str | None):
     """Resolve model name to engine."""
     if not model or not _engines:
         return engine
@@ -216,7 +215,7 @@ async def chat(session_id: str, req: SendMessageRequest):
 async def _stream_chat(
     session_id: str,
     messages: list[dict],
-    eng: MLXEngine | None = None,
+    eng=None,
     temperature: float = 0.6,
     top_p: float = 1.0,
     min_p: float = 0.0,
@@ -237,46 +236,40 @@ async def _stream_chat(
     prompt_tps = 0.0
     token_count = 0
 
-    # Cache info for stats
-    t_cache_check = time.perf_counter()
+    # Session/runtime info for stats
     session_state = eng._sessions.get(session_id)
     if not session_state and eng._has_disk_cache(session_id):
         session_state = eng._load_session_from_disk(session_id)
         if session_state:
             eng._sessions[session_id] = session_state
     cache_hit = False
-    cache_info = {"type": "none", "detail": "New session"}
+    cache_info = {"type": "new_session", "detail": "New local session"}
     if session_state:
         if eng._messages_match(session_state.messages, messages):
-            cache_hit = session_state.cache is not None
-            cached_tokens = session_state.total_cache_tokens
-            new_msgs = messages[len(session_state.messages):]
-            suffix_desc = f"{len(new_msgs)} new message(s)" if new_msgs else "retry"
-            from_disk = (
-                session_id not in eng._sessions
-                or eng._sessions.get(session_id) is not session_state
-            )
-            source = "disk -> memory" if from_disk else "memory"
-            cache_info = {
-                "type": "kv_cache_hit" if cache_hit else "kv_cache_rebuild",
-                "detail": (
-                    f"KV Cache reuse ({source}): {cached_tokens} tokens cached, {suffix_desc}"
-                    if cache_hit
-                    else f"Rebuilding KV cache for {len(messages)} messages"
-                ),
-                "cached_tokens": cached_tokens,
-                "stored_msgs": len(session_state.messages),
-                "source": source,
-            }
+            if getattr(eng, "supports_prefix_cache", False) and session_state.cache is not None:
+                cache_hit = True
+                cached_tokens = session_state.total_cache_tokens
+                new_msgs = messages[len(session_state.messages):]
+                suffix_desc = f"{len(new_msgs)} new message(s)" if new_msgs else "retry"
+                cache_info = {
+                    "type": "cache_hit",
+                    "detail": f"Prompt cache reused with {cached_tokens} cached tokens; {suffix_desc}",
+                    "cached_tokens": cached_tokens,
+                    "stored_msgs": len(session_state.messages),
+                }
+            else:
+                cache_info = {
+                    "type": "session_resume",
+                    "detail": "Session history restored; upstream backend handles prompt caching",
+                    "stored_msgs": len(session_state.messages),
+                }
         else:
             cache_info = {
-                "type": "kv_cache_miss",
-                "detail": f"Conversation changed, reprocessing {len(messages)} messages",
+                "type": "session_replace",
+                "detail": f"Session history changed; replacing stored messages ({len(messages)} total)",
                 "stored_msgs": len(session_state.messages),
                 "incoming_msgs": len(messages),
             }
-    t_cache_done = time.perf_counter()
-
     start_event = json.dumps(
         {"type": "start", "cache_hit": cache_hit, "cache_info": cache_info},
         ensure_ascii=False,
@@ -354,8 +347,8 @@ async def _stream_chat(
         "completion_tokens": completion_tokens,
         "gen_tps": round(gen_tps, 1),
         "prompt_tps": round(prompt_tps, 1),
-        "cache_hit": cache_hit,
-        "cache_info": cache_info,
+                        "cache_hit": cache_hit,
+                        "cache_info": cache_info,
     }
 
     if accumulated_text:
@@ -390,7 +383,7 @@ async def _stream_chat(
     yield f"data: {done_event}\n\n"
 
 
-async def _sync_chat(session_id: str, messages: list[dict], eng: MLXEngine | None = None) -> dict:
+async def _sync_chat(session_id: str, messages: list[dict], eng=None) -> dict:
     """Non-streaming chat response."""
     eng = eng or engine
     result = eng.complete(messages, session_id=session_id)

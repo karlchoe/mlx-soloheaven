@@ -1,8 +1,9 @@
-"""Command-line interface for MLX SoloHeaven."""
+"""Command-line interface for SoloHeaven."""
+
+from __future__ import annotations
 
 import argparse
 import os
-import sys
 
 
 def _env(key: str, default: str | None = None) -> str | None:
@@ -11,126 +12,126 @@ def _env(key: str, default: str | None = None) -> str | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog="mlx-soloheaven",
-        description="Single-user LLM inference server with KV cache optimization for Apple Silicon",
+    parser = argparse.ArgumentParser(
+        prog="soloheaven",
+        description="OpenAI-compatible chat server for Qwen3.5 and other upstream models",
     )
 
-    p.add_argument(
-        "--model", "-m",
+    parser.add_argument(
+        "--model",
+        "-m",
         default=_env("MODEL"),
-        help="Path to MLX model directory (env: SOLOHEAVEN_MODEL)",
+        help="Upstream model ID exposed by your OpenAI-compatible backend (env: SOLOHEAVEN_MODEL)",
     )
-    # SOLOHEAVEN_MODELS: comma-separated paths (e.g., "/path/model1,/path/model2")
-    _models_env = _env("MODELS", "").strip()
-    p.add_argument(
+
+    models_env = _env("MODELS", "").strip()
+    parser.add_argument(
         "--models",
         nargs="+",
-        default=_models_env.split(",") if _models_env else None,
-        help="Multiple models: 'path' or 'alias=path' (env: SOLOHEAVEN_MODELS, comma-separated)",
+        default=models_env.split(",") if models_env else None,
+        help=(
+            "Multiple upstream models: 'model-id' or 'alias=model-id', "
+            "optional ':no_think_tag' suffix (env: SOLOHEAVEN_MODELS)"
+        ),
     )
-    p.add_argument(
+    parser.add_argument(
+        "--openai-base-url",
+        default=_env("OPENAI_BASE_URL", ""),
+        help="Base URL for the upstream OpenAI-compatible backend (example: http://127.0.0.1:8001/v1)",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        default=_env("OPENAI_API_KEY", "EMPTY"),
+        help="API key for the upstream backend (default: EMPTY)",
+    )
+    parser.add_argument(
         "--host",
         default=_env("HOST", "0.0.0.0"),
         help="Bind address (default: 0.0.0.0)",
     )
-    p.add_argument(
-        "--port", "-p",
+    parser.add_argument(
+        "--port",
+        "-p",
         type=int,
         default=int(_env("PORT", "8000")),
         help="Listen port (default: 8000)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--temperature",
         type=float,
         default=float(_env("TEMPERATURE", "0.6")),
         help="Default sampling temperature (default: 0.6)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--top-p",
         type=float,
         default=float(_env("TOP_P", "1.0")),
         help="Default nucleus sampling top-p (default: 1.0, disabled)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--min-p",
         type=float,
         default=float(_env("MIN_P", "0.0")),
         help="Default min-p sampling threshold (default: 0.0, disabled)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--top-k",
         type=int,
         default=int(_env("TOP_K", "0")),
         help="Default top-k sampling (default: 0, disabled)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--repetition-penalty",
         type=float,
         default=float(_env("REPETITION_PENALTY", "1.0")),
         help="Default repetition penalty (default: 1.0, disabled)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=int(_env("MAX_TOKENS", "32768")),
         help="Default max generation tokens (default: 32768)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--thinking-budget",
         type=int,
         default=int(_env("THINKING_BUDGET", "8192")),
         help="Max thinking tokens before forcing </think> (default: 8192, 0=unlimited)",
     )
-    p.add_argument(
-        "--memory-budget-gb",
-        type=float,
-        default=float(_env("MEMORY_BUDGET_GB", "200")),
-        help="In-memory KV cache budget in GB (default: 200)",
-    )
-    p.add_argument(
-        "--disk-budget-gb",
-        type=float,
-        default=float(_env("DISK_BUDGET_GB", "100")),
-        help="On-disk KV cache budget in GB (default: 100)",
-    )
-    p.add_argument(
+    parser.add_argument(
         "--data-dir",
         default=_env("DATA_DIR", "./data"),
-        help="Directory for SQLite DB and KV cache files (default: ./data)",
+        help="Directory for the SQLite database and local session metadata (default: ./data)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--no-thinking",
         action="store_true",
-        help="Disable thinking mode globally (default: on). Per-model: use :no_think_tag suffix",
+        help="Disable thinking mode globally (default: enabled)",
     )
-    p.add_argument(
-        "--verbose", "-v",
+    parser.add_argument(
+        "--verbose",
+        "-v",
         action="store_true",
         default=_env("VERBOSE", "").lower() in ("1", "true", "yes"),
         help="Enable verbose logging (env: SOLOHEAVEN_VERBOSE)",
     )
-    p.add_argument(
-        "--gpu-keepalive",
-        action="store_true",
-        default=_env("GPU_KEEPALIVE", "").lower() in ("1", "true", "yes"),
-        help="Keep Metal GPU warm to avoid idle penalty (env: SOLOHEAVEN_GPU_KEEPALIVE)",
-    )
 
-    args = p.parse_args(argv)
+    args = parser.parse_args(argv)
 
     if not args.model and not args.models:
-        p.error(
-            "Model path is required. Set --model or --models, or SOLOHEAVEN_MODEL environment variable."
+        parser.error(
+            "Model ID is required. Set --model or --models, or SOLOHEAVEN_MODEL."
         )
+    if not args.openai_base_url:
+        parser.error("--openai-base-url is required")
 
     return args
 
 
 def main(argv: list[str] | None = None):
-    # Load .env file if present (before parsing args so env vars are available)
     try:
         from dotenv import load_dotenv
+
         load_dotenv()
     except ImportError:
         pass
@@ -138,7 +139,6 @@ def main(argv: list[str] | None = None):
     args = parse_args(argv)
 
     from mlx_soloheaven.config import Config
-    cfg = Config.from_args(args)
-
     from mlx_soloheaven.server import run_server
-    run_server(cfg)
+
+    run_server(Config.from_args(args))
